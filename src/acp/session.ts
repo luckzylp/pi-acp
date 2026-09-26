@@ -40,6 +40,8 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /** ACP additionalDirectories: extra workspace roots beyond cwd (absolute paths). */
+  additionalDirectories?: string[]
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -212,7 +214,8 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        additionalDirectories: params.additionalDirectories
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -241,7 +244,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      additionalDirectories: params.additionalDirectories ?? []
     })
 
     this.sessions.set(sessionId, session)
@@ -268,7 +272,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      additionalDirectories: params.additionalDirectories ?? []
     })
 
     this.sessions.set(sessionId, session)
@@ -280,6 +285,7 @@ export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
   readonly mcpServers: McpServer[]
+  readonly additionalDirectories: string[]
 
   private startupInfo: string | null = null
   private startupInfoSent = false
@@ -324,10 +330,12 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    additionalDirectories?: string[]
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
     this.mcpServers = opts.mcpServers
+    this.additionalDirectories = opts.additionalDirectories ?? []
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
