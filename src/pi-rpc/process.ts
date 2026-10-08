@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as readline from 'node:readline'
 import crossSpawn from 'cross-spawn'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
@@ -103,6 +106,27 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /**
+   * Additional workspace roots (ACP `additionalDirectories`). Communicated to pi via
+   * `--append-system-prompt` since pi has no native multi-root workspace support.
+   */
+  additionalDirectories?: readonly string[]
+}
+
+/**
+ * Build the system-prompt text describing the session's workspace root set.
+ * pi appends this to its system prompt so the model treats the additional
+ * directories as part of the user's workspace.
+ */
+export function buildWorkspaceRootsPrompt(cwd: string, dirs: readonly string[]): string {
+  return [
+    '<workspace_roots>',
+    `Primary working directory: ${cwd}`,
+    "Additional workspace roots (also part of the user's workspace):",
+    ...dirs.map(dir => `- ${dir}`),
+    '</workspace_roots>',
+    "The user's workspace spans the primary working directory and the additional workspace roots listed above. Treat files under the additional roots as part of the workspace: read, search, and edit them using absolute paths. Relative paths still resolve against the primary working directory."
+  ].join('\n')
 }
 
 export class PiRpcProcess {
@@ -162,6 +186,28 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
+    // Workspace roots go through `--append-system-prompt`, which pi resolves from a
+    // file when the argument is an existing path. Using a temp file (instead of inline
+    // text) sidesteps argument-length/quoting limits for long multi-line text across
+    // platforms (and matches how pi discovers other prompt sources).
+    let workspaceRootsDir: string | null = null
+    if (params.additionalDirectories && params.additionalDirectories.length > 0) {
+      workspaceRootsDir = mkdtempSync(join(tmpdir(), 'pi-acp-'))
+      const promptFile = join(workspaceRootsDir, 'workspace-roots.txt')
+      writeFileSync(promptFile, buildWorkspaceRootsPrompt(params.cwd, params.additionalDirectories), 'utf-8')
+      args.push('--append-system-prompt', promptFile)
+    }
+
+    const removeWorkspaceRootsDir = () => {
+      if (!workspaceRootsDir) return
+      try {
+        rmSync(workspaceRootsDir, { recursive: true, force: true })
+      } catch {
+        // best effort; the file lives in the OS temp dir
+      }
+      workspaceRootsDir = null
+    }
+
     // Windows cmd launchers need shell escaping; direct executables use native argv.
     const start = shouldUseShellForPiCommand(cmd) ? crossSpawn : spawn
     const child = start(cmd, args, {
@@ -169,6 +215,11 @@ export class PiRpcProcess {
       stdio: 'pipe',
       env: process.env
     }) as ChildProcessWithoutNullStreams
+
+    // Remove the temp file when the subprocess goes away; pi may re-read it on
+    // resource reloads, so it must live exactly as long as the process.
+    child.on('exit', removeWorkspaceRootsDir)
+    child.on('error', removeWorkspaceRootsDir)
 
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
     // deterministic error instead of later EPIPE/internal-error noise.
@@ -191,6 +242,7 @@ export class PiRpcProcess {
         child.once('error', onError)
       })
     } catch (e: any) {
+      removeWorkspaceRootsDir()
       const code = typeof e?.code === 'string' ? e.code : undefined
       if (code === 'ENOENT') {
         throw new PiRpcSpawnError(
