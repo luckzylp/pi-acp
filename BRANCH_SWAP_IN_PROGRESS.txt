@@ -1,0 +1,2 @@
+This file marks the branch swap operation in progress.
+The content will be replaced with sync-upstream branch content.
