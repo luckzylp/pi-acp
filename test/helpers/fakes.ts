@@ -32,6 +32,7 @@ export class FakePiRpcProcess {
   getSessionStatsCount = 0
 
   sessionStats: PiSessionStats = {}
+  commands: unknown = { commands: [] }
   /** When set, `getSessionStats()` rejects with this error. */
   sessionStatsError: unknown = null
 
@@ -78,6 +79,10 @@ export class FakePiRpcProcess {
     this.getSessionStatsCount += 1
     if (this.sessionStatsError) throw this.sessionStatsError
     return this.sessionStats
+  }
+
+  async getCommands(): Promise<unknown> {
+    return this.commands
   }
 }
 

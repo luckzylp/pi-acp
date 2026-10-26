@@ -1100,3 +1100,86 @@ test('PiAcpSession: cancelled turn still reports cancelled after usage publish',
     [{ sessionUpdate: 'usage_update', used: 42, size: 100 }]
   )
 })
+
+test('PiAcpSession: de-duplicates unchanged usage readings', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.sessionStats = { contextUsage: { tokens: 1_200, contextWindow: 272_000 } }
+  await session.publishContextUsage()
+  await session.publishContextUsage()
+
+  proc.sessionStats = { contextUsage: { tokens: 1_800, contextWindow: 272_000 } }
+  await session.publishContextUsage()
+
+  assert.deepEqual(
+    conn.updates.map(entry => entry.update),
+    [
+      { sessionUpdate: 'usage_update', used: 1_200, size: 272_000 },
+      { sessionUpdate: 'usage_update', used: 1_800, size: 272_000 }
+    ]
+  )
+})
+
+test('PiAcpSession: forwards visible custom extension messages with metadata', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'my-extension',
+      content: 'Extension output',
+      display: true,
+      details: { kind: 'banner', ok: true }
+    }
+  } as any)
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'my-extension',
+      content: 'hidden continuation',
+      display: false
+    }
+  } as any)
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', customType: 'my-extension', content: '', display: true }
+  } as any)
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: 'normal assistant message' }
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(conn.updates, [
+    {
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Extension output' },
+        _meta: { piAcp: { customType: 'my-extension', details: { kind: 'banner', ok: true } } }
+      }
+    }
+  ])
+})

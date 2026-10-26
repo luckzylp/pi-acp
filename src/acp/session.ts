@@ -329,6 +329,7 @@ export class PiAcpSession {
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
+  private lastUsage: { used: number; size: number } | null = null
 
   constructor(opts: {
     sessionId: string
@@ -408,6 +409,43 @@ export class PiAcpSession {
     })
 
     return turnPromise
+  }
+
+  /**
+   * Execute a Pi extension command through RPC without waiting for `agent_settled`.
+   * Extension handlers may run child agents and extension UI requests, but the parent
+   * Pi session does not start an agent loop for the command itself, so the RPC response
+   * is the authoritative completion boundary.
+   */
+  async runExtensionCommand(message: string): Promise<StopReason> {
+    if (this.pendingTurn) {
+      throw RequestError.invalidParams('Cannot start an extension command while an agent turn is running')
+    }
+
+    this.cancelRequested = false
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: {
+        piAcp: { queueDepth: 0, running: true, extensionCommand: message.trim().split(/\s+/, 1)[0] }
+      }
+    })
+
+    try {
+      await this.proc.prompt(message, [])
+      await this.flushEmits()
+      await this.publishContextUsage()
+      return this.cancelRequested ? 'cancelled' : 'end_turn'
+    } catch (error) {
+      const authError = maybeAuthRequiredError(error)
+      if (authError) throw authError
+      return this.cancelRequested ? 'cancelled' : 'error'
+    } finally {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+      await this.flushEmits()
+    }
   }
 
   async cancel(): Promise<void> {
@@ -511,7 +549,13 @@ export class PiAcpSession {
       // Older/stubbed pi processes may not expose the stats RPC at all.
       if (typeof this.proc.getSessionStats === 'function') {
         const update = toUsageUpdate(await this.proc.getSessionStats(SESSION_STATS_TIMEOUT_MS))
-        if (update) this.emit(update)
+        if (update?.sessionUpdate === 'usage_update') {
+          const unchanged = this.lastUsage?.used === update.used && this.lastUsage?.size === update.size
+          if (!unchanged) {
+            this.lastUsage = { used: update.used, size: update.size }
+            this.emit(update)
+          }
+        }
       }
     } catch {
       // Context usage is auxiliary; never fail or delay the turn because of it.
@@ -743,6 +787,27 @@ export class PiAcpSession {
         }
 
         // Ignore other delta/event types for now.
+        break
+      }
+
+      case 'message_end': {
+        const message = (ev as any).message
+        if (message?.role !== 'custom' || message?.display === false) break
+
+        const text = typeof message.content === 'string' ? message.content : ''
+        const details = message.details
+        if (!text && !details) break
+
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text } satisfies ContentBlock,
+          _meta: {
+            piAcp: {
+              customType: typeof message.customType === 'string' ? message.customType : null,
+              details: details ?? null
+            }
+          }
+        } as SessionUpdate)
         break
       }
 
