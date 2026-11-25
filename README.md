@@ -32,6 +32,13 @@ Expect some minor breaking changes.
   - Reports pi's real context occupancy (`get_session_stats` → `contextUsage`) to the client as ACP `usage_update` after each turn, on `session/new` and `session/load`, and after a model switch
   - Requires a pi version whose `get_session_stats` response includes `contextUsage`; otherwise no usage is reported
   - Right after compaction pi may not have a trustworthy token count yet, so the client keeps the previous value until the next model response
+- Thread titles
+  - A new session is named from its first prompt right away, so the thread is never unnamed while the first turn runs
+  - When that turn ends, `pi-acp` summarizes the session and replaces the placeholder with a generated title, pushed as ACP `session_info_update` and persisted through pi's `set_session_name`, so the `pi` CLI and the ACP client show the same name
+  - Timing mirrors Claude Code's ACP adapter ("push session title updates at turn end"): the title request starts after the `session/prompt` stop reason is delivered, and a title is generated at most once per session
+  - Generation uses a throwaway `pi --print` run (no session, tools, extensions, MCP servers or context files) with the session's current model, so it costs one small extra request per session and never touches the conversation
+  - An explicit rename always wins: `/name`, a title restored by `session/load`, or a name set by pi (TUI, extension) disables generation for that session
+  - Disable it entirely with `PI_ACP_AUTO_TITLE=0` (the first-prompt name is kept)
 - Skills are loaded by pi directly and are available in ACP sessions
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
@@ -121,6 +128,11 @@ Point your ACP client to the built `dist/index.js`:
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - Default: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+
+- `PI_ACP_AUTO_TITLE=0` disables generated thread titles (`0`, `false`, `off`, `no` are all accepted).
+- Default: unset means enabled. Sessions then keep the title derived from their first prompt.
+
+- `PI_ACP_PI_COMMAND` overrides the `pi` executable. It is also used for the title request.
 
 You can add the environment variable in the Zed settings with:
 

@@ -225,7 +225,7 @@ export class PiAcpAgent implements ACPAgent {
       this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
 
       const title = readPiSessionTitle(stored.sessionFile)
-      if (title) await session.publishTitle(title, null)
+      if (title) await session.restoreTitle(title)
 
       return session
     })()

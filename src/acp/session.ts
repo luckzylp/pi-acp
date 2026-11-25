@@ -22,6 +22,12 @@ import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
+  generateSessionTitle,
+  isTitleGenerationEnabled,
+  sanitizeGeneratedTitle,
+  type SessionTitleGenerator
+} from './title.js'
+import {
   bashCommand,
   bashExitCode,
   bashOutputDelta,
@@ -68,6 +74,20 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+/** Generated titles are opportunistic: a session that keeps failing is left with its placeholder. */
+const MAX_TITLE_GENERATION_ATTEMPTS = 3
+/** Conversation text handed to the title request. */
+const TITLE_SOURCE_MAX_CHARS = 4_000
+
+/**
+ * Where the current session title came from:
+ * - `none`: nothing published yet
+ * - `placeholder`: the first prompt, used until a generated title arrives
+ * - `generated`: produced from the conversation; never regenerated
+ * - `fixed`: restored, set by the client (`/name`), or assigned by pi/extensions
+ */
+type TitleSource = 'none' | 'placeholder' | 'generated' | 'fixed'
 
 /**
  * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null whenever pi
@@ -194,6 +214,7 @@ export class SessionManager {
     const s = this.sessions.get(sessionId)
     if (!s) return
     try {
+      s.dispose()
       s.proc.dispose?.()
     } catch {
       // ignore
@@ -248,6 +269,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       autoTitle: true,
+      generateTitle: isTitleGenerationEnabled(),
+      piCommand: params.piCommand,
       additionalDirectories: params.additionalDirectories ?? []
     })
 
@@ -277,6 +300,8 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       autoTitle: false,
+      generateTitle: isTitleGenerationEnabled(),
+      piCommand: params.piCommand,
       additionalDirectories: params.additionalDirectories ?? []
     })
 
@@ -296,6 +321,22 @@ export class PiAcpSession {
   private initialTitlePending: boolean
   private lastPublishedTitle: string | null | undefined
   private titleUpdateQueue: Promise<void> = Promise.resolve()
+
+  // Titles: a first-prompt placeholder keeps the thread named while it runs, then
+  // the finished turn is summarized into a generated title (see `maybeGenerateTitle`).
+  private titleSource: TitleSource = 'none'
+  private titleGenerationAttempts = 0
+  private titleGenerationInFlight = false
+  private readonly assignedTitles = new Set<string>()
+  private readonly titleAbort = new AbortController()
+  private readonly titleGenerator: SessionTitleGenerator | null
+  private readonly piCommand: string | undefined
+  private disposed = false
+
+  // Inputs for the title request: the session's opening message and the assistant
+  // text of the turn that just settled.
+  private firstPromptText: string | null = null
+  private turnAssistantText = ''
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -339,6 +380,12 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     autoTitle?: boolean
+    /** Generate a conversation title when a turn ends (default: on). */
+    generateTitle?: boolean
+    /** pi executable used for the title request; defaults to the one running the session. */
+    piCommand?: string
+    /** Test seam; production uses the out-of-band pi request. */
+    titleGenerator?: SessionTitleGenerator
     additionalDirectories?: string[]
   }) {
     this.sessionId = opts.sessionId
@@ -349,8 +396,16 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
     this.initialTitlePending = opts.autoTitle ?? false
+    this.piCommand = opts.piCommand
+    this.titleGenerator = (opts.generateTitle ?? true) ? (opts.titleGenerator ?? generateSessionTitle) : null
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
+  }
+
+  /** Stop background work (title generation) before the pi process goes away. */
+  dispose(): void {
+    this.disposed = true
+    this.titleAbort.abort()
   }
 
   setStartupInfo(text: string) {
@@ -476,9 +531,22 @@ export class PiAcpSession {
 
   async setSessionName(name: string): Promise<void> {
     return this.enqueueTitleUpdate(async () => {
+      // An explicit rename wins: it must never be replaced by a generated title.
+      this.titleSource = 'fixed'
+      this.assignedTitles.add(name)
       await this.proc.setSessionName(name)
       this.publishTitle(name)
     })
+  }
+
+  /**
+   * Publish the title stored with an existing session (session/load, /resume).
+   * Restored titles are treated as fixed so a new turn cannot rename them.
+   */
+  async restoreTitle(title: string): Promise<void> {
+    this.titleSource = 'fixed'
+    this.assignedTitles.add(title)
+    await this.publishTitle(title, null)
   }
 
   private enqueueTitleUpdate(update: () => Promise<void>): Promise<void> {
@@ -507,16 +575,90 @@ export class PiAcpSession {
         const state = (await this.proc.getState()) as { sessionName?: unknown } | null
         const currentTitle = typeof state?.sessionName === 'string' ? state.sessionName.trim() : ''
         if (currentTitle) {
+          this.titleSource = 'fixed'
           this.publishTitle(currentTitle)
           return
         }
         if (this.lastPublishedTitle) return
 
+        this.assignedTitles.add(title)
         await this.proc.setSessionName(title)
+        this.titleSource = 'placeholder'
         this.publishTitle(title)
       })
     } catch {
       // Auto-titling is best-effort and must not fail the completed prompt.
+    }
+  }
+
+  /**
+   * Summarize the turn that just settled and push the result as `session_info_update`.
+   * Timing mirrors Claude Code's ACP adapter (title at turn end) instead of the
+   * first-prompt placeholder every ACP client starts with.
+   */
+  private maybeGenerateTitle(reason: StopReason): void {
+    if (!this.titleGenerator || this.disposed) return
+    if (reason !== 'end_turn') return
+    if (this.titleSource === 'fixed' || this.titleSource === 'generated') return
+    if (this.titleGenerationInFlight) return
+    if (this.titleGenerationAttempts >= MAX_TITLE_GENERATION_ATTEMPTS) return
+    if (!this.firstPromptText) return
+
+    // Capture the finished turn's text before a queued prompt resets it.
+    const userPrompt = this.firstPromptText
+    const assistantText = this.turnAssistantText
+
+    this.titleGenerationAttempts += 1
+    this.titleGenerationInFlight = true
+
+    void this.runTitleGeneration(userPrompt, assistantText).finally(() => {
+      this.titleGenerationInFlight = false
+    })
+  }
+
+  private async runTitleGeneration(userPrompt: string, assistantText: string): Promise<void> {
+    const generator = this.titleGenerator
+    if (!generator) return
+
+    try {
+      const model = await this.readSessionModel()
+      if (this.disposed || this.titleSource === 'fixed' || this.titleSource === 'generated') return
+
+      const title = await generator({
+        cwd: this.cwd,
+        piCommand: this.piCommand,
+        provider: model.provider,
+        modelId: model.id,
+        userPrompt,
+        assistantText,
+        signal: this.titleAbort.signal
+      })
+
+      const clean = title ? sanitizeGeneratedTitle(title) : null
+      if (!clean || this.disposed) return
+
+      await this.enqueueTitleUpdate(async () => {
+        // A rename may have landed while the model was answering.
+        if (this.titleSource === 'fixed' || this.titleSource === 'generated') return
+
+        this.assignedTitles.add(clean)
+        await this.proc.setSessionName(clean)
+        this.titleSource = 'generated'
+        this.publishTitle(clean)
+      })
+    } catch {
+      // Titling is auxiliary; a failed request leaves the placeholder in place.
+    }
+  }
+
+  private async readSessionModel(): Promise<{ provider?: string; id?: string }> {
+    try {
+      const state = (await this.proc.getState()) as { model?: { provider?: unknown; id?: unknown } } | null
+      const provider = typeof state?.model?.provider === 'string' ? state.model.provider : undefined
+      const id = typeof state?.model?.id === 'string' ? state.model.id : undefined
+      return { provider, id }
+    } catch {
+      return {}
     }
   }
 
@@ -570,9 +712,13 @@ export class PiAcpSession {
     await this.publishContextUsage()
 
     const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+    const hadTurn = this.pendingTurn !== null
     this.pendingTurn?.resolve(reason)
     this.pendingTurn = null
     this.inAgentLoop = false
+
+    // Fire-and-forget: the client got its stop reason, the title lands right after.
+    if (hadTurn) this.maybeGenerateTitle(reason)
 
     // Start next queued prompt, if any.
     const next = this.turnQueue.shift()
@@ -648,6 +794,9 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.inAgentLoop = false
 
+    if (this.firstPromptText === null) this.firstPromptText = t.message.slice(0, TITLE_SOURCE_MAX_CHARS)
+    this.turnAssistantText = ''
+
     this.pendingTurn = { title: t.title, resolve: t.resolve, reject: t.reject }
     void this.maybeAutoTitle(t.title)
 
@@ -693,6 +842,9 @@ export class PiAcpSession {
     switch (type) {
       case 'session_info_changed': {
         const name = (ev as { name?: unknown }).name
+        // A name we did not write came from the client, pi's TUI, or an extension:
+        // treat it as authoritative and stop generating titles for this session.
+        if (typeof name === 'string' && !this.assignedTitles.has(name)) this.titleSource = 'fixed'
         if (typeof name === 'string' || name === undefined) this.publishTitle(name ?? null)
         break
       }
@@ -702,6 +854,7 @@ export class PiAcpSession {
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+          this.turnAssistantText = (this.turnAssistantText + ame.delta).slice(-TITLE_SOURCE_MAX_CHARS)
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
